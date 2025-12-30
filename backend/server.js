@@ -1,40 +1,51 @@
+require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
-const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+
+const configureMiddleware = require('./middleware/configureMiddleware');
+
 const authRoutes = require('./routes/authRoutes');
 const consumerRoutes = require('./routes/consumerRoutes');
 const billRoutes = require('./routes/billRoutes');
-require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Create uploads directory if it doesn't exist
+// uploads folder
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-app.use(cors());
-app.use(express.json());
-app.use(express.static('uploads')); // Serve uploaded files
+// ✅ Use middleware here
+configureMiddleware(app);
 
+// static
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// health route
+app.get('/', (req, res) => {
+  res.status(200).send('✅ SmartEB Backend is Live on Render 🚀');
+});
+
+// routes
 app.use('/api/auth', authRoutes);
-app.use('/api/consumers', consumerRoutes); // Add route for consumer operations
-app.use('/api/bills', billRoutes); // Add route for bill calculations
+app.use('/api/consumers', consumerRoutes);
+app.use('/api/bills', billRoutes);
 
+// start server
 const startServer = async () => {
   try {
     await mongoose.connect(process.env.MONGO_URI);
-    console.log("✅ Connected to MongoDB");
+    console.log('✅ Connected to MongoDB');
 
     app.listen(PORT, () => {
-      console.log(`🚀 Server running at http://localhost:${PORT}`);
+      console.log(`🚀 Server running on port ${PORT}`);
     });
-  } catch (error) {
-    console.error("❌ MongoDB connection error:", error);
+  } catch (err) {
+    console.error('❌ MongoDB error:', err.message);
     process.exit(1);
   }
 };
