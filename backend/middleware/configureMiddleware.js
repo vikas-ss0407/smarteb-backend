@@ -3,7 +3,7 @@ const cors = require('cors');
 
 const configureMiddleware = (app) => {
   const allowedOrigins = [
-    "https://smartebfrontend.onrender.com", // deployed frontend
+    "https://emeterseva.onrender.com", // deployed frontend
     "http://localhost:5173"                 // local frontend (adjust port if needed)
   ];
 
