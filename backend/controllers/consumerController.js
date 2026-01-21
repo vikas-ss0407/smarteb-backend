@@ -32,7 +32,7 @@ const getCycleWindows = (date) => {
 // Process meter image via AI service
 exports.validateMeterImage = async (req, res) => {
   try {
-    const { consumerNumber, userReading, aiExtractedReading, manualReading } = req.body;
+    const { consumerNumber, user_reading } = req.body;
     
     if (!req.file) {
       return res.status(400).json({ message: 'No image file uploaded' });
@@ -42,14 +42,12 @@ exports.validateMeterImage = async (req, res) => {
       return res.status(400).json({ message: 'Consumer number is required' });
     }
 
-    if (!userReading) {
-      return res.status(400).json({ message: 'User reading is required' });
-    }
-
     // Create form data for AI service
     const formData = new FormData();
-    formData.append('image', fs.createReadStream(req.file.path));
-    formData.append('user_reading', userReading);
+    
+    // Use buffer from memory storage instead of file path
+    formData.append('image', req.file.buffer, { filename: req.file.originalname });
+    formData.append('user_reading', user_reading || '0');
 
     try {
       // Call AI service
@@ -62,106 +60,32 @@ exports.validateMeterImage = async (req, res) => {
         }
       );
 
-      // Delete the uploaded file
-      fs.unlinkSync(req.file.path);
-
       if (aiResponse.data.status === 'VALID') {
         // Check if OCR extraction was successful
         const ocrReading = aiResponse.data.meter_reading;
         
         if (!ocrReading || ocrReading.trim() === '') {
           // OCR failed - user must enter manually
-          return res.status(400).json({ 
+          return res.status(200).json({ 
             status: 'OCR_FAILED',
+            meter_reading: null,
             message: 'Could not extract reading from image. Please enter manually.',
-            image_valid: aiResponse.data.image_valid,
+            image_valid: true,
             reason: 'No valid meter reading could be extracted. Image is valid but OCR failed to detect digits.'
           });
         }
 
-        // Update consumer record with the reading
-        const consumer = await Consumer.findOne({ consumerNumber });
-        if (!consumer) {
-          return res.status(404).json({ message: 'Consumer not found' });
-        }
-
-        const previousReading = consumer.currentReading || 0;
-        const currentReading = parseFloat(userReading);
-        const unitsConsumed = currentReading - previousReading;
-
-        // Check if current reading is strictly greater than previous reading
-        if (currentReading <= previousReading) {
-          return res.status(400).json({ 
-            status: 'INVALID',
-            reason: `Current reading (${currentReading}) must be greater than previous reading (${previousReading})`,
-            ocr_value: ocrReading
-          });
-        }
-
-        // Validate readings match (AI extracted vs Manual vs Submitted)
-        const aiValue = parseFloat(ocrReading);
-        const manualValue = parseFloat(manualReading) || currentReading;
-        
-        const readingsDifference = Math.abs(aiValue - manualValue);
-        if (readingsDifference > 1) {
-          return res.status(400).json({ 
-            status: 'INVALID',
-            reason: `Readings do not match. AI extracted: ${aiValue}, Your entry: ${manualValue}. Difference: ${readingsDifference.toFixed(2)} units`,
-            ocr_value: ocrReading
-          });
-        }
-
-        const tariffRates = {
-          domestic: 5,
-          commercial: 10,
-          industrial: 15,
-        };
-
-        const rate = tariffRates[consumer.tariffPlan.toLowerCase()] || 5;
-        const amount = unitsConsumed * rate;
-
-        consumer.currentReading = currentReading;
-        consumer.amount = amount;
-
-        // New billing window: reading captured now, payment due 15 days after reading window end (15th)
-        consumer.lastBillDate = new Date();
-        consumer.nextPaymentDeadline = computePaymentDeadline(consumer.lastBillDate);
-        consumer.paymentStatus = 'Pending';
-
-        // Reset any previous penalties when a fresh bill is generated
-        consumer.isFineApplied = false;
-        consumer.fineAmount = 0;
-        consumer.cgstOnFine = 0;
-        consumer.sgstOnFine = 0;
-        consumer.totalFineWithTax = 0;
-        
-        if (!consumer.readings) consumer.readings = [];
-        consumer.readings.push({
-          date: new Date(),
-          units: unitsConsumed,
-          aiExtractedReading: aiValue,
-          manualReading: manualValue
-        });
-
-        await consumer.save();
-
+        // Return only the AI-extracted reading for display
+        // Frontend will handle validation and submission
         return res.json({
           status: 'VALID',
           meter_reading: ocrReading,
-          manual_reading: manualReading,
-          units_consumed: unitsConsumed,
-          amount: amount,
-          consumer: consumer
+          message: `AI extracted reading: ${ocrReading} kWh`
         });
       } else {
         return res.status(400).json(aiResponse.data);
       }
     } catch (aiError) {
-      // Delete the uploaded file if exists
-      if (req.file) {
-        fs.unlinkSync(req.file.path);
-      }
-      
       console.error('AI Service error:', aiError.message);
       return res.status(500).json({ 
         message: 'Error communicating with AI service',
@@ -169,14 +93,6 @@ exports.validateMeterImage = async (req, res) => {
       });
     }
   } catch (err) {
-    // Clean up uploaded file on error
-    if (req.file) {
-      try {
-        fs.unlinkSync(req.file.path);
-      } catch (e) {
-        console.error('Error deleting file:', e);
-      }
-    }
     res.status(500).json({ message: err.message });
   }
 };
@@ -480,6 +396,26 @@ const calculateFine = () => {
   };
 };
 
+// Apply fine to an overdue consumer and persist flags/amounts. Returns true when a fine is newly set.
+const applyFineIfOverdue = (consumer) => {
+  const deadline = consumer.nextPaymentDeadline ? new Date(consumer.nextPaymentDeadline) : null;
+  if (!deadline) return false;
+
+  const now = new Date();
+  const isOverdue = now > deadline && consumer.paymentStatus !== 'Paid';
+  if (!isOverdue || consumer.isFineApplied) return false;
+
+  const fineDetails = calculateFine();
+  consumer.fineAmount = fineDetails.fineAmount;
+  consumer.cgstOnFine = fineDetails.cgstOnFine;
+  consumer.sgstOnFine = fineDetails.sgstOnFine;
+  consumer.totalFineWithTax = fineDetails.totalFineWithTax;
+  consumer.isFineApplied = true;
+  consumer.fineAppliedDate = now;
+  consumer.paymentStatus = 'Overdue';
+  return true;
+};
+
 // Get bill summary with deadline and reminder
 exports.getBillSummary = async (req, res) => {
   try {
@@ -669,19 +605,77 @@ exports.markPaymentAsPaid = async (req, res) => {
   }
 };
 
-// Get all consumers with fines (for admin)
+// Get all consumers with fines (for admin) and auto-apply fines when overdue
 exports.getConsumersWithFines = async (req, res) => {
   try {
-    const consumersWithFines = await Consumer.find({ 
-      isFineApplied: true,
-      paymentStatus: { $ne: 'Paid' }
-    }).select(
-      'consumerNumber name address phoneNumber meterSerialNumber tariffPlan amount fineAmount cgstOnFine sgstOnFine totalFineWithTax fineAppliedDate paymentStatus'
-    );
+    const candidates = await Consumer.find({ paymentStatus: { $ne: 'Paid' } });
+    const finedConsumers = [];
 
-    res.json(consumersWithFines);
+    for (const consumer of candidates) {
+      const newlyFined = applyFineIfOverdue(consumer);
+      if (newlyFined) {
+        await consumer.save();
+      }
+
+      if (consumer.isFineApplied) {
+        finedConsumers.push({
+          consumerNumber: consumer.consumerNumber,
+          name: consumer.name,
+          address: consumer.address,
+          phoneNumber: consumer.phoneNumber,
+          meterSerialNumber: consumer.meterSerialNumber,
+          tariffPlan: consumer.tariffPlan,
+          amount: consumer.amount,
+          fineAmount: consumer.fineAmount,
+          cgstOnFine: consumer.cgstOnFine,
+          sgstOnFine: consumer.sgstOnFine,
+          totalFineWithTax: consumer.totalFineWithTax,
+          fineAppliedDate: consumer.fineAppliedDate,
+          paymentStatus: consumer.paymentStatus
+        });
+      }
+    }
+
+    res.json(finedConsumers);
   } catch (error) {
     console.error('Error fetching consumers with fines:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// Get all consumers who missed submitting readings in the last reading window
+exports.getConsumersWithMissedReadings = async (req, res) => {
+  try {
+    const now = new Date();
+    const { readingStart, readingEnd, idleEnd } = getCycleWindows(now);
+
+    const consumers = await Consumer.find({});
+    const missed = [];
+
+    for (const consumer of consumers) {
+      const lastBillDate = consumer.lastBillDate ? startOfDay(consumer.lastBillDate) : null;
+      // Consider a reading recorded any time within the current cycle (day 1-60) as fulfilling the cycle
+      const hasReadingThisCycle = lastBillDate && lastBillDate >= readingStart && lastBillDate <= idleEnd;
+      const failedToUpload = now > readingEnd && !hasReadingThisCycle;
+
+      if (failedToUpload) {
+        missed.push({
+          consumerNumber: consumer.consumerNumber,
+          name: consumer.name,
+          address: consumer.address,
+          phoneNumber: consumer.phoneNumber,
+          meterSerialNumber: consumer.meterSerialNumber,
+          tariffPlan: consumer.tariffPlan,
+          lastBillDate: consumer.lastBillDate,
+          readingWindowStart: readingStart,
+          readingWindowEnd: readingEnd
+        });
+      }
+    }
+
+    res.json(missed);
+  } catch (error) {
+    console.error('Error fetching consumers with missed readings:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };

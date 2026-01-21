@@ -5,15 +5,8 @@ const multer = require('multer');
 const path = require('path');
 const authMiddleware = require('../middleware/authMiddleware');
 
-// Configure multer for image uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    cb(null, `meter-${Date.now()}${path.extname(file.originalname)}`);
-  }
-});
+// Configure multer for image uploads (memory storage - no disk write)
+const storage = multer.memoryStorage();
 
 const upload = multer({
   storage: storage,
@@ -33,6 +26,7 @@ router.use(authMiddleware);
 
 // Bill summary and payment routes (specific routes before generic ones)
 router.get('/fines/all', consumerController.getConsumersWithFines);
+router.get('/readings/missed', consumerController.getConsumersWithMissedReadings);
 router.get('/bill-summary/:consumerNumber', consumerController.getBillSummary);
 router.post('/mark-paid/:consumerNumber', consumerController.markPaymentAsPaid);
 
